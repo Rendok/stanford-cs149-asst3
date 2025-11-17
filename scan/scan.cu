@@ -1,9 +1,12 @@
+#include <cstddef>
 #include <stdio.h>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <driver_functions.h>
+
+#include <math.h>
 
 #include <thrust/scan.h>
 #include <thrust/device_ptr.h>
@@ -26,6 +29,58 @@ static inline int nextPow2(int n) {
     n++;
     return n;
 }
+
+
+
+__global__ void scan_pre_block_kernel(int* input, int N, int* block_sums, int* result) {
+    __shared__ int XY[THREADS_PER_BLOCK];
+    const int array_size = THREADS_PER_BLOCK;
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < N) {
+        XY[threadIdx.x] = input[index];
+    } else {
+        XY[threadIdx.x] = 0;
+    }
+
+    __syncthreads();
+
+    for (size_t stride = 1; stride < array_size / 2; stride *= 2) {
+        if ((threadIdx.x + 1) % (2 * stride) == 0) {
+            XY[threadIdx.x] += XY[threadIdx.x - stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == array_size - 1) {
+        XY[threadIdx.x] = 0;
+    }
+    
+    for (size_t stride = array_size / 2; stride > 0; stride /= 2) {
+        if ((index + 1) % (2 * stride) == 0) {
+            int temp = XY[threadIdx.x];
+            XY[threadIdx.x] += XY[threadIdx.x - stride];
+            XY[threadIdx.x - stride] = temp;
+        }
+        __syncthreads();
+    }
+
+    if (block_sums != nullptr && threadIdx.x == array_size - 1) {
+        block_sums[blockIdx.x] = XY[threadIdx.x] + input[index];
+    }
+
+    result[index] = XY[threadIdx.x];
+}
+
+
+__global__ void parallel_join_kernel(int* S, int* result) {
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    result[index] += S[blockIdx.x];
+}
+
+
+// __global__ void parallel_join_kernel(int* input, int N, int* result) {
 
 // exclusive_scan --
 //
@@ -53,6 +108,38 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+
+    const int num_blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    if (num_blocks == 1) {
+        scan_pre_block_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(input, N, nullptr, result);
+        return;
+    }
+
+    int* block_sums = nullptr;
+    cudaMalloc((void**)&block_sums, sizeof(int) * num_blocks);
+
+    scan_pre_block_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(input, N, block_sums, result);
+
+    // Recursively scan block_sums until we get one block.
+    if (num_blocks > THREADS_PER_BLOCK) {
+        int* temp_block_sums = nullptr;
+        cudaMalloc((void**)&temp_block_sums, sizeof(int) * num_blocks);
+        cudaMemcpy(temp_block_sums, block_sums, sizeof(int) * num_blocks, cudaMemcpyDeviceToDevice);
+        
+        exclusive_scan(temp_block_sums, num_blocks, block_sums);
+        
+        cudaFree(temp_block_sums);
+    } else {
+        scan_pre_block_kernel<<<1, THREADS_PER_BLOCK>>>(block_sums, num_blocks, nullptr, block_sums);
+    }
+
+    // Add the block sums to the result.
+    parallel_join_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(block_sums, result);
+
+    cudaFree(block_sums);
+
+
 
 
 }
@@ -102,6 +189,8 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     double endTime = CycleTimer::currentSeconds();
        
     cudaMemcpy(resultarray, device_result, (end - inarray) * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(device_result);
+    cudaFree(device_input);
 
     double overallDuration = endTime - startTime;
     return overallDuration; 

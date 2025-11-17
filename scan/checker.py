@@ -78,7 +78,8 @@ def run_tests():
         )
 
         # Get reference time
-        ref_cmd = f"./{ref_binary} -m {test} -i random -n {element_count} | tee ./logs/ref/{test}_time_{element_count}.log | grep 'Student GPU time:'"
+        # ref_cmd = f"./{ref_binary} -m {test} -i random -n {element_count} | tee ./logs/ref/{test}_time_{element_count}.log | grep 'Student GPU time:'"
+        ref_cmd = f"./cudaScan -t -m {test} -i random -n {element_count} | tee ./logs/test/{test}_time_{element_count}.log | grep 'Thrust GPU time:'"
         fast_times[element_count] = get_time(ref_cmd)
         print(f"Ref Time: {fast_times[element_count]}")
 
