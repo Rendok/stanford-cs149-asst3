@@ -33,54 +33,55 @@ static inline int nextPow2(int n) {
 
 
 __global__ void scan_pre_block_kernel(int* input, int N, int* block_sums, int* result) {
-    __shared__ int XY[THREADS_PER_BLOCK];
-    const int array_size = THREADS_PER_BLOCK;
-    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ int XY[2 * THREADS_PER_BLOCK];
+    const size_t global_index = 2 * (blockIdx.x * blockDim.x + threadIdx.x) + 1;
+    const size_t local_index = 2 * threadIdx.x + 1;
 
-    if (index < N) {
-        XY[threadIdx.x] = input[index];
+    if (global_index < N) {
+        XY[local_index] = input[global_index];
+        XY[local_index - 1] = input[global_index - 1];
     } else {
-        XY[threadIdx.x] = 0;
+        XY[local_index] = 0;
+        XY[local_index - 1] = 0;
     }
 
     __syncthreads();
 
-    for (size_t stride = 1; stride < array_size / 2; stride *= 2) {
-        if ((threadIdx.x + 1) % (2 * stride) == 0) {
-            XY[threadIdx.x] += XY[threadIdx.x - stride];
+    for (size_t stride = 1; stride < blockDim.x; stride *= 2) {
+        if ((local_index + 1) % (2 * stride) == 0) {
+            XY[local_index] += XY[local_index - stride];
         }
         __syncthreads();
     }
 
-    if (threadIdx.x == array_size - 1) {
-        XY[threadIdx.x] = 0;
+    if (threadIdx.x == blockDim.x - 1) {
+        XY[local_index] = 0;
     }
     
-    for (size_t stride = array_size / 2; stride > 0; stride /= 2) {
-        if ((index + 1) % (2 * stride) == 0) {
-            int temp = XY[threadIdx.x];
-            XY[threadIdx.x] += XY[threadIdx.x - stride];
-            XY[threadIdx.x - stride] = temp;
+    for (size_t stride = blockDim.x; stride > 0; stride /= 2) {
+        if ((local_index + 1) % (2 * stride) == 0) {
+            int temp = XY[local_index];
+            XY[local_index] += XY[local_index - stride];
+            XY[local_index - stride] = temp;
         }
         __syncthreads();
     }
 
-    if (block_sums != nullptr && threadIdx.x == array_size - 1) {
-        block_sums[blockIdx.x] = XY[threadIdx.x] + input[index];
+    if (block_sums != nullptr && threadIdx.x == blockDim.x - 1) {
+        block_sums[blockIdx.x] = XY[local_index] + input[global_index];
     }
 
-    result[index] = XY[threadIdx.x];
+    result[global_index] = XY[local_index];
+    result[global_index - 1] = XY[local_index - 1];
 }
 
 
 __global__ void parallel_join_kernel(int* S, int* result) {
     const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    result[index] += S[blockIdx.x];
+    result[index] += S[blockIdx.x / 2];
 }
 
-
-// __global__ void parallel_join_kernel(int* input, int N, int* result) {
 
 // exclusive_scan --
 //
@@ -109,7 +110,8 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
-    const int num_blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    const int num_blocks = (N + 2 * THREADS_PER_BLOCK - 1) / (2 * THREADS_PER_BLOCK);
+    // scan_pre_bloc`k_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(input, N, nullptr, result);
 
     if (num_blocks == 1) {
         scan_pre_block_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(input, N, nullptr, result);
@@ -122,7 +124,7 @@ void exclusive_scan(int* input, int N, int* result)
     scan_pre_block_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(input, N, block_sums, result);
 
     // Recursively scan block_sums until we get one block.
-    if (num_blocks > THREADS_PER_BLOCK) {
+    if (num_blocks > 2 * THREADS_PER_BLOCK) {
         int* temp_block_sums = nullptr;
         cudaMalloc((void**)&temp_block_sums, sizeof(int) * num_blocks);
         cudaMemcpy(temp_block_sums, block_sums, sizeof(int) * num_blocks, cudaMemcpyDeviceToDevice);
@@ -135,7 +137,7 @@ void exclusive_scan(int* input, int N, int* result)
     }
 
     // Add the block sums to the result.
-    parallel_join_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(block_sums, result);
+    parallel_join_kernel<<<2 * num_blocks, THREADS_PER_BLOCK>>>(block_sums, result);
 
     cudaFree(block_sums);
 
