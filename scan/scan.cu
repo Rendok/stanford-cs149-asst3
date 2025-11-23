@@ -111,7 +111,6 @@ void exclusive_scan(int* input, int N, int* result)
     // scan.
 
     const int num_blocks = (N + 2 * THREADS_PER_BLOCK - 1) / (2 * THREADS_PER_BLOCK);
-    // scan_pre_bloc`k_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(input, N, nullptr, result);
 
     if (num_blocks == 1) {
         scan_pre_block_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(input, N, nullptr, result);
@@ -231,6 +230,28 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+__global__ void find_repeats_mask_kernel(int* input, int N, int* result) {
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < N - 1) {
+        if (input[index] == input[index + 1]) {
+            result[index] = 1;
+        } else {
+            result[index] = 0;
+        }
+    }
+}
+
+__global__ void gather_indices_kernel(int* input, int* mask, int* scan, int N, int* count, int* result) {
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (index < N && mask[index] == 1) {
+        result[scan[index]] = index;
+    }
+
+    if (index == N - 1) {
+        *count = scan[N - 1];
+    }
+}
 
 // find_repeats --
 //
@@ -252,7 +273,27 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    const int num_blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    int* device_repeats_mask = nullptr;
+    cudaMalloc((void**)&device_repeats_mask, sizeof(int) * length);
+    find_repeats_mask_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(device_input, length, device_repeats_mask);
+
+    int* device_scan_output = nullptr;
+    cudaMalloc((void**)&device_scan_output, sizeof(int) * length);
+    exclusive_scan(device_repeats_mask, length, device_scan_output);
+    
+    int* device_total_num_pairs = nullptr;
+    cudaMalloc((void**)&device_total_num_pairs, sizeof(int));
+    gather_indices_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(device_input, device_repeats_mask, device_scan_output, length, device_total_num_pairs, device_output);
+
+    int host_total_num_pairs;
+    cudaMemcpy(&host_total_num_pairs, device_total_num_pairs, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(device_total_num_pairs);
+    cudaFree(device_scan_output);
+    cudaFree(device_repeats_mask);
+
+    return host_total_num_pairs; 
 }
 
 
